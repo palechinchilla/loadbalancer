@@ -15,6 +15,10 @@ import socket
 import traceback
 import logging
 
+import boto3
+from botocore.config import Config as BotoConfig
+from botocore.exceptions import ClientError, NoCredentialsError
+
 from network_volume import (
     is_network_volume_debug_enabled,
     run_network_volume_diagnostics,
@@ -185,6 +189,19 @@ def validate_input(job_input):
                 "'images' must be a list of objects with 'name' and 'image' keys",
             )
 
+    # Validate 's3_loras' in input, if provided
+    s3_loras = job_input.get("s3_loras")
+    if s3_loras is not None:
+        if not isinstance(s3_loras, list):
+            return None, "'s3_loras' must be a list"
+        required_keys = {"endpoint_url", "access_key_id", "secret_access_key", "bucket", "key"}
+        for i, lora in enumerate(s3_loras):
+            if not isinstance(lora, dict):
+                return None, f"'s3_loras[{i}]' must be an object"
+            missing = required_keys - set(lora.keys())
+            if missing:
+                return None, f"'s3_loras[{i}]' missing required keys: {missing}"
+
     # Optional: API key for Comfy.org API Nodes, passed per-request
     comfy_org_api_key = job_input.get("comfy_org_api_key")
 
@@ -192,6 +209,7 @@ def validate_input(job_input):
     return {
         "workflow": workflow,
         "images": images,
+        "s3_loras": s3_loras,
         "comfy_org_api_key": comfy_org_api_key,
     }, None
 
@@ -369,6 +387,100 @@ def upload_images(images):
     return {
         "status": "success",
         "message": "All images uploaded successfully",
+        "details": responses,
+    }
+
+
+# Directory where ComfyUI looks for LoRA files (created in Dockerfile)
+COMFY_LORAS_DIR = "/comfyui/models/loras"
+
+
+def download_s3_loras(s3_loras):
+    """
+    Download LoRA files from S3 into ComfyUI's loras directory.
+
+    Args:
+        s3_loras (list): List of dicts, each with:
+            - endpoint_url (str): S3 endpoint URL
+            - access_key_id (str): S3 access key
+            - secret_access_key (str): S3 secret key
+            - bucket (str): S3 bucket name
+            - key (str): S3 object key (e.g. "loras/mymodel.safetensors")
+            - region (str, optional): S3 region, defaults to "auto"
+
+    Returns:
+        dict: Status with "status" key ("success" or "error") and "details" list.
+    """
+    if not s3_loras:
+        return {"status": "success", "message": "No LoRAs to download", "details": []}
+
+    responses = []
+    download_errors = []
+
+    print(f"worker-comfyui - Downloading {len(s3_loras)} LoRA(s) from S3...")
+
+    for lora in s3_loras:
+        try:
+            endpoint_url = lora["endpoint_url"]
+            access_key_id = lora["access_key_id"]
+            secret_access_key = lora["secret_access_key"]
+            bucket = lora["bucket"]
+            key = lora["key"]
+            region = lora.get("region", "auto")
+
+            filename = key.split("/")[-1]
+            target_path = os.path.join(COMFY_LORAS_DIR, filename)
+
+            s3_client = boto3.client(
+                "s3",
+                endpoint_url=endpoint_url,
+                aws_access_key_id=access_key_id,
+                aws_secret_access_key=secret_access_key,
+                region_name=region,
+                config=BotoConfig(s3={"addressing_style": "path"}),
+            )
+
+            # Check if file already exists with matching size (warm worker cache)
+            try:
+                head = s3_client.head_object(Bucket=bucket, Key=key)
+                s3_size = head["ContentLength"]
+
+                if os.path.exists(target_path):
+                    local_size = os.path.getsize(target_path)
+                    if local_size == s3_size:
+                        print(f"worker-comfyui - LoRA '{filename}' already cached ({s3_size} bytes), skipping download")
+                        responses.append(f"Cached {filename}")
+                        continue
+            except ClientError:
+                pass  # head_object failed, proceed with download attempt
+
+            print(f"worker-comfyui - Downloading LoRA '{filename}' from s3://{bucket}/{key}...")
+            s3_client.download_file(bucket, key, target_path)
+            file_size = os.path.getsize(target_path)
+            print(f"worker-comfyui - Successfully downloaded {filename} ({file_size} bytes)")
+            responses.append(f"Downloaded {filename}")
+
+        except (ClientError, NoCredentialsError) as e:
+            error_msg = f"S3 error downloading '{lora.get('key', 'unknown')}': {e}"
+            print(f"worker-comfyui - {error_msg}")
+            download_errors.append(error_msg)
+        except Exception as e:
+            error_msg = f"Unexpected error downloading '{lora.get('key', 'unknown')}': {e}"
+            print(f"worker-comfyui - {error_msg}")
+            download_errors.append(error_msg)
+
+    if download_errors:
+        print(f"worker-comfyui - LoRA download(s) finished with errors")
+        return {
+            "status": "error",
+            "message": "Some LoRA files failed to download",
+            "details": download_errors,
+        }
+
+    print(f"worker-comfyui - LoRA download(s) complete")
+    return {
+        "status": "success",
+        "message": "All LoRA files downloaded successfully",
         "details": responses,
     }
 
@@ -615,6 +727,16 @@ def handler(job):
             return {
                 "error": "Failed to upload one or more input images",
                 "details": upload_result["details"],
+            }
+
+    # Download S3 LoRA files if specified
+    s3_loras = validated_data.get("s3_loras")
+    if s3_loras:
+        lora_result = download_s3_loras(s3_loras)
+        if lora_result["status"] == "error":
+            return {
+                "error": "Failed to download one or more LoRA files from S3",
+                "details": lora_result["details"],
             }
 
     ws = None
