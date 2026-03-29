@@ -104,6 +104,13 @@ RUN wget -q -O /tmp/sageattention-2.2.0-cp312-cp312-linux_x86_64.whl \
 # been lost during the PyTorch uninstall/reinstall cycle above)
 RUN uv pip install --no-cache-dir -r /comfyui/requirements.txt
 
+# Re-pin PyTorch cu130 in case ComfyUI requirements overwrote it
+RUN uv pip install --no-cache-dir \
+    torch==2.10.0+cu130 \
+    torchvision==0.25.0+cu130 \
+    torchaudio==2.10.0+cu130 \
+    --index-url https://download.pytorch.org/whl/cu130
+
 # Change working directory to ComfyUI
 WORKDIR /comfyui
 
