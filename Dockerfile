@@ -100,6 +100,10 @@ RUN wget -q -O /tmp/sageattention-2.2.0-cp312-cp312-linux_x86_64.whl \
     uv pip install --no-cache-dir /tmp/sageattention-2.2.0-cp312-cp312-linux_x86_64.whl && \
     rm /tmp/sageattention-2.2.0-cp312-cp312-linux_x86_64.whl
 
+# Reinstall ComfyUI's own requirements (alembic, comfy_aimdo, etc. may have
+# been lost during the PyTorch uninstall/reinstall cycle above)
+RUN uv pip install --no-cache-dir -r /comfyui/requirements.txt
+
 # Change working directory to ComfyUI
 WORKDIR /comfyui
 
